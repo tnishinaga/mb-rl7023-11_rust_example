@@ -4,17 +4,12 @@
 #![no_std]
 #![no_main]
 
-use core::fmt::Debug;
 use core::net::Ipv6Addr;
-use core::ops::Sub;
-use core::slice::SliceIndex;
-use core::str::{self, FromStr};
-
-use bbqueue::{BBBuffer, Consumer, GrantR, Producer};
+use core::str::{self};
+use bbqueue::{BBBuffer, Consumer, Producer};
 use bp35a1::command::Sreg;
-use bp35a1::parser::{Bp35a1Parser, Event, EventNumber, Info};
+use bp35a1::parser::{Bp35a1Parser, EventNumber};
 use bp35a1::{command::Bp35a1Command, parser::Bp35a1Packet};
-use cortex_m::prelude::_embedded_hal_blocking_serial_Write;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
@@ -31,12 +26,6 @@ use embassy_rp::peripherals::{SPI0, UART0};
 use embassy_rp::spi::{Async, Config as SpiConfig, Spi};
 use embassy_rp::uart::BufferedUartTx;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartRx, Config};
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
-use embassy_sync::blocking_mutex::NoopMutex;
-use embassy_sync::channel;
-use embassy_sync::channel::{Channel, Sender};
-use embassy_sync::pipe::Pipe;
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal_1::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -51,24 +40,6 @@ bind_interrupts!(struct Irqs {
 
 // include credential info
 include!("broute_credential.rs");
-
-const TRANSACTION_INDEX_OFFSET: usize = 2;
-const ECHONET_LITE_FLAME: &[u8; 14] = &[
-    0x10, 0x81, //echonet lite header
-    0x00, 0x00, // transaction ID
-    0x05, 0xFF, 0x01, // SEOJ(source is controller)
-    0x02, 0x88, 0x01, // DEOJ(destination is smart meter)
-    0x62, // ESV(Get)
-    0x01, // OPC
-    0xE7, // EPC(瞬時電力計測値)
-    0x00, // PDC
-          // EDT
-];
-
-const ECHONET_LITE_HEADER_MAGIC: [u8; 2] = [0x10, 0x81];
-const RESP_GET_RESP_INDEX_OFFSET_AND_DATA: (usize, u8) = (10, 0x72); // Get Response
-const RESP_POWER_CONSUMPTION_OFFSET: usize = 17; // Get Response
-const RESP_PDC_OFFSET: usize = 16;
 
 const UART_BUF: usize = 1024 * 2;
 
@@ -202,9 +173,6 @@ async fn receive_tcp_input(
         }
     }
 }
-
-static LATEST_CURRENT_POWER_CONSUMPTION: embassy_sync::mutex::Mutex<ThreadModeRawMutex, u32> =
-    embassy_sync::mutex::Mutex::new(0);
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -518,29 +486,6 @@ impl Bp35a1Manager {
         Ok(())
     }
 
-    pub async fn get_local_info(&mut self) -> Result<Info, ()> {
-        Bp35a1Command::info(self).unwrap();
-        loop {
-            match self.receive_bp35a1_packet().await.unwrap() {
-                Bp35a1Packet::EchoBack => break,
-                _ => {
-                    embassy_futures::yield_now().await;
-                    continue;
-                }
-            }
-        }
-        let info = loop {
-            match self.receive_bp35a1_packet().await.unwrap() {
-                Bp35a1Packet::Info(info) => break info,
-                _ => {
-                    embassy_futures::yield_now().await;
-                    continue;
-                }
-            }
-        };
-        Ok(info)
-    }
-
     async fn receive_bp35a1_packet_inner(&mut self) -> Result<Option<Bp35a1Packet>, ()> {
         let grant = match self.uart_rx.read() {
             Ok(ok) => Ok(ok),
@@ -797,9 +742,9 @@ impl embedded_nal_async::UnconnectedUdp for Bp35a1Manager {
 
     async fn send(
         &mut self,
-        local: core::net::SocketAddr,
-        remote: core::net::SocketAddr,
-        data: &[u8],
+        _local: core::net::SocketAddr,
+        _remote: core::net::SocketAddr,
+        _data: &[u8],
     ) -> Result<(), Self::Error> {
         // TODO: SEND_TO
         core::todo!()
@@ -807,7 +752,7 @@ impl embedded_nal_async::UnconnectedUdp for Bp35a1Manager {
 
     async fn receive_into(
         &mut self,
-        buffer: &mut [u8],
+        _buffer: &mut [u8],
     ) -> Result<(usize, core::net::SocketAddr, core::net::SocketAddr), Self::Error> {
         // put received data from channel
         core::todo!()
