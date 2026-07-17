@@ -1,37 +1,36 @@
 [package]
+# Assisted-by: Codex:GPT-5.6 Luna
 edition = "2021"
 name = "pico-w5500-power-meter"
 version = "0.1.0"
 rust-version = "1.81"
 
 [dependencies]
-# embassy (2024-09-10 latest commit id : 0ef06cc19b61c8196fea941514ec313a0f15d145)
-embassy-sync = { version = "0.6.0", git = "https://github.com/embassy-rs/embassy", rev = "0ef06cc19b61c8196fea941514ec313a0f15d145", features = [
+# Embassy crates from crates.io
+embassy-sync = { version = "0.8.0", features = [
     "defmt",
 ] }
-embassy-executor = { version = "0.6.0", git = "https://github.com/embassy-rs/embassy", rev = "0ef06cc19b61c8196fea941514ec313a0f15d145", features = [
-    "task-arena-size-98304",
-    "arch-cortex-m",
+embassy-executor = { version = "0.10.0", features = [
+    "platform-cortex-m",
     "executor-thread",
     "executor-interrupt",
     "defmt",
-    "integrated-timers",
 ] }
 
-embassy-time = { version = "0.3", git = "https://github.com/embassy-rs/embassy", rev = "0ef06cc19b61c8196fea941514ec313a0f15d145", features = [
+embassy-time = { version = "0.5.1", features = [
     "defmt",
     "defmt-timestamp-uptime",
 ] }
-embassy-rp = { version = "0.2", git = "https://github.com/embassy-rs/embassy", rev = "0ef06cc19b61c8196fea941514ec313a0f15d145", features = [
+embassy-rp = { version = "0.10.0", features = [
     "unstable-pac",
     "time-driver",
     "critical-section-impl",
     "rp2040",
 ] }
-embassy-usb = { version = "0.3", git = "https://github.com/embassy-rs/embassy", rev = "0ef06cc19b61c8196fea941514ec313a0f15d145", features = [
+embassy-usb = { version = "0.6.0", features = [
     "defmt",
 ] }
-embassy-net = { version = "0.4.0", git = "https://github.com/embassy-rs/embassy", rev = "0ef06cc19b61c8196fea941514ec313a0f15d145", features = [
+embassy-net = { version = "0.9.1", features = [
     "defmt",
     "tcp",
     "udp",
@@ -40,15 +39,16 @@ embassy-net = { version = "0.4.0", git = "https://github.com/embassy-rs/embassy"
     "medium-ethernet",
     "dns",
 ] }
-embassy-net-wiznet = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy", rev = "0ef06cc19b61c8196fea941514ec313a0f15d145", features = [
+embassy-net-wiznet = { version = "0.3.0", features = [
     "defmt",
 ] }
-embassy-futures = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy", rev = "0ef06cc19b61c8196fea941514ec313a0f15d145" }
-embassy-usb-logger = { version = "0.2.0", git = "https://github.com/embassy-rs/embassy", rev = "0ef06cc19b61c8196fea941514ec313a0f15d145" }
+embassy-futures = { version = "0.1.2" }
+embassy-usb-logger = { version = "0.6.0" }
 embedded-hal-1 = { package = "embedded-hal", version = "1.0" }
 embedded-hal-async = "1.0"
 embedded-hal-bus = { version = "0.1", features = ["async"] }
-embedded-io-async = { version = "0.6.1", features = [] }
+embedded-io-async = { version = "0.7.0", features = [] }
+embedded-io-async-06 = { package = "embedded-io-async", version = "0.6.1", features = [] }
 embedded-storage = { version = "0.3" }
 
 defmt = "0.3"
