@@ -3,6 +3,8 @@
 //!
 //! Example written for the [`WIZnet W5500-EVB-Pico`](https://www.wiznet.io/product-item/w5500-evb-pico/) board.
 
+// Assisted-by: Codex:GPT-5.6 Luna
+
 #![no_std]
 #![no_main]
 
@@ -19,11 +21,18 @@ use bp35a1::{command::Bp35a1Command, parser::Bp35a1Packet};
 use cortex_m::prelude::_embedded_hal_blocking_serial_Write;
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_futures::yield_now;
+use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
+use embassy_net_wiznet::chip::W5500;
+use embassy_net_wiznet::{Device, Runner, State};
 use embassy_rp::bind_interrupts;
+use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::Level;
 use embassy_rp::gpio::Output;
-use embassy_rp::peripherals::UART0;
+use embassy_rp::gpio::{Input, Pull};
+use embassy_rp::peripherals::{SPI0, UART0};
+use embassy_rp::spi::{Async, Config as SpiConfig, Spi};
 use embassy_rp::uart::BufferedUartTx;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartRx, Config};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -32,9 +41,11 @@ use embassy_sync::blocking_mutex::NoopMutex;
 use embassy_sync::channel;
 use embassy_sync::channel::{Channel, Sender};
 use embassy_sync::pipe::Pipe;
-use embassy_time::Timer;
+use embassy_time::{Delay, Duration, Timer};
 use embedded_hal_1::delay::DelayNs;
+use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_io_async::{Read, Write};
+use rand::RngCore;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -63,11 +74,138 @@ const RESP_GET_RESP_INDEX_OFFSET_AND_DATA: (usize, u8) = (10, 0x72); // Get Resp
 const RESP_POWER_CONSUMPTION_OFFSET: usize = 17; // Get Response
 const RESP_PDC_OFFSET: usize = 16;
 
-const UART_BUF: usize = 1024 * 8;
+const UART_BUF: usize = 1024 * 2;
 
 const UART_QUEUE_SIZE: usize = UART_BUF * 2;
-static UART_RX_QUEUE: BBBuffer<UART_QUEUE_SIZE> = bbqueue::BBBuffer::new();
-static UART_TX_QUEUE: BBBuffer<UART_QUEUE_SIZE> = bbqueue::BBBuffer::new();
+static UART_RX_QUEUE: StaticCell<BBBuffer<UART_QUEUE_SIZE>> = StaticCell::new();
+static UART_TX_QUEUE: StaticCell<BBBuffer<UART_QUEUE_SIZE>> = StaticCell::new();
+
+const TCP_BUF_SIZE: usize = 1024;
+const TCP_QUEUE_SIZE: usize = TCP_BUF_SIZE;
+static TCP_TO_WISUN: StaticCell<BBBuffer<TCP_QUEUE_SIZE>> = StaticCell::new();
+static WISUN_TO_TCP: StaticCell<BBBuffer<TCP_QUEUE_SIZE>> = StaticCell::new();
+
+const TCP_PORT: u16 = 3610;
+
+#[embassy_executor::task]
+async fn ethernet_task(
+    runner: Runner<
+        'static,
+        W5500,
+        ExclusiveDevice<Spi<'static, SPI0, Async>, Output<'static>, Delay>,
+        Input<'static>,
+        Output<'static>,
+    >,
+) -> ! {
+    info!("W5500: ethernet task started");
+    runner.run().await
+}
+
+#[embassy_executor::task]
+async fn net_task(stack: &'static Stack<Device<'static>>) -> ! {
+    info!("network: task started");
+    stack.run().await
+}
+
+#[embassy_executor::task]
+async fn tcp_task(
+    stack: &'static Stack<Device<'static>>,
+    mut from_pc: Producer<'static, TCP_QUEUE_SIZE>,
+    mut to_pc: Consumer<'static, TCP_QUEUE_SIZE>,
+) -> ! {
+    info!("TCP: task started");
+    static RX_STORAGE: StaticCell<[u8; TCP_BUF_SIZE]> = StaticCell::new();
+    static TX_STORAGE: StaticCell<[u8; TCP_BUF_SIZE]> = StaticCell::new();
+    static TCP_BUF: StaticCell<[u8; TCP_BUF_SIZE]> = StaticCell::new();
+    let rx_storage = RX_STORAGE.init([0u8; TCP_BUF_SIZE]);
+    let tx_storage = TX_STORAGE.init([0u8; TCP_BUF_SIZE]);
+    let buf = TCP_BUF.init([0u8; TCP_BUF_SIZE]);
+    loop {
+        let mut socket =
+            embassy_net::tcp::TcpSocket::new(stack, &mut rx_storage[..], &mut tx_storage[..]);
+        info!("TCP: listening on port {}", TCP_PORT);
+        if socket.accept(TCP_PORT).await.is_err() {
+            warn!("TCP: accept failed");
+            continue;
+        }
+        info!("TCP: client connected");
+        loop {
+            while let Ok(grant) = to_pc.read() {
+                if grant.is_empty() {
+                    grant.release(0);
+                    break;
+                }
+                debug!("TCP: sending {} bytes to PC", grant.buf().len());
+                if socket.write_all(grant.buf()).await.is_err() {
+                    warn!("TCP: write to PC failed");
+                    grant.release(0);
+                    socket.abort();
+                    break;
+                }
+                let size = grant.buf().len();
+                grant.release(size);
+            }
+
+            match select(
+                socket.read(&mut buf[..]),
+                Timer::after(Duration::from_millis(1)),
+            )
+            .await
+            {
+                Either::First(Ok(0)) => break,
+                Either::First(Ok(size)) => {
+                    debug!("TCP: received {} bytes from PC", size);
+                    loop {
+                        match from_pc.grant_exact(size) {
+                            Ok(mut grant) => {
+                                grant.buf().copy_from_slice(&buf[..size]);
+                                grant.commit(size);
+                                break;
+                            }
+                            Err(
+                                bbqueue::Error::InsufficientSize | bbqueue::Error::GrantInProgress,
+                            ) => {
+                                yield_now().await;
+                            }
+                            Err(_) => {
+                                warn!("TCP: input queue unavailable");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Either::First(Err(_)) => {
+                    warn!("TCP: read from PC failed");
+                    break;
+                }
+                Either::Second(_) => (),
+            }
+        }
+        socket.abort();
+        info!("TCP: client disconnected");
+    }
+}
+
+async fn receive_tcp_input(
+    queue: &mut Consumer<'static, TCP_QUEUE_SIZE>,
+    buffer: &mut [u8],
+) -> usize {
+    loop {
+        match queue.read() {
+            Ok(grant) => {
+                let grant_size = grant.buf().len();
+                let size = core::cmp::min(grant_size, buffer.len());
+                buffer[..size].copy_from_slice(&grant.buf()[..size]);
+                grant.release(grant_size);
+                return size;
+            }
+            Err(bbqueue::Error::InsufficientSize | bbqueue::Error::GrantInProgress) => {
+                yield_now().await;
+            }
+            Err(bbqueue::Error::AlreadySplit) => return 0,
+        }
+    }
+}
 
 static LATEST_CURRENT_POWER_CONSUMPTION: embassy_sync::mutex::Mutex<ThreadModeRawMutex, u32> =
     embassy_sync::mutex::Mutex::new(0);
@@ -75,15 +213,66 @@ static LATEST_CURRENT_POWER_CONSUMPTION: embassy_sync::mutex::Mutex<ThreadModeRa
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+    info!("boot: firmware started; RP2040 peripherals initialized");
+
+    let mut spi_config = SpiConfig::default();
+    spi_config.frequency = 50_000_000;
+    info!("W5500: configuring SPI0 at 50 MHz");
+    let spi = Spi::new(
+        p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, p.DMA_CH0, p.DMA_CH1, spi_config,
+    );
+    info!("W5500: configuring CS/INT/RESET pins");
+    let cs = Output::new(p.PIN_17, Level::High);
+    let w5500_int = Input::new(p.PIN_21, Pull::Up);
+    let w5500_reset = Output::new(p.PIN_20, Level::High);
+    // One TCP listener and one UDP/maintenance socket are enough for this
+    // bridge. Keeping eight TX/RX socket buffers wastes a large part of SRAM.
+    static ETH_STATE: StaticCell<State<2, 2>> = StaticCell::new();
+    info!("W5500: starting chip initialization");
+    let (device, runner) = embassy_net_wiznet::new(
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
+        ETH_STATE.init(State::new()),
+        ExclusiveDevice::new(spi, cs, Delay),
+        w5500_int,
+        w5500_reset,
+    )
+    .await
+    .unwrap();
+    info!("W5500: initialized");
+    info!("W5500: spawning ethernet runner");
+    unwrap!(spawner.spawn(ethernet_task(runner)));
+
+    static STACK: StaticCell<Stack<Device<'static>>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    info!("network: creating IPv4 stack");
+    let mut rng = RoscRng;
+    let stack = &*STACK.init(Stack::new(
+        device,
+        embassy_net::Config::ipv4_static(StaticConfigV4 {
+            address: Ipv4Cidr::new(Ipv4Address::new(192, 168, 200, 200), 24),
+            gateway: None,
+            dns_servers: Default::default(),
+        }),
+        RESOURCES.init(StackResources::new()),
+        rng.next_u64(),
+    ));
+    info!("network: IPv4 stack created");
+    unwrap!(spawner.spawn(net_task(stack)));
+    info!("network: configured as 192.168.200.200/24");
 
     // reset
+    info!("Wi-SUN: resetting module");
     let mut reset_pin = Output::new(p.PIN_15, Level::High);
+    info!("Wi-SUN: asserting reset");
     reset_pin.set_low();
     embassy_time::Delay.delay_ms(1000);
+    info!("Wi-SUN: releasing reset");
     reset_pin.set_high();
     embassy_time::Delay.delay_ms(1000);
+    info!("Wi-SUN: reset complete");
 
     let (tx_pin, rx_pin, uart) = (p.PIN_0, p.PIN_1, p.UART0);
+    info!("UART: configuring UART0");
 
     static TX_BUF: StaticCell<[u8; UART_BUF]> = StaticCell::new();
     let tx_buf = &mut TX_BUF.init([0; UART_BUF])[..];
@@ -98,17 +287,31 @@ async fn main(spawner: Spawner) {
         rx_buf,
         Config::default(),
     );
+    info!("UART: initialized");
     let (uart_tx, uart_rx) = uart.split();
-    let (tx_producer, tx_consumer) = UART_TX_QUEUE.try_split().unwrap();
-    let (rx_producer, rx_consumer) = UART_RX_QUEUE.try_split().unwrap();
+    info!("UART: split into TX/RX");
+    let (tx_producer, tx_consumer) = UART_TX_QUEUE.init(BBBuffer::new()).try_split().unwrap();
+    let (rx_producer, rx_consumer) = UART_RX_QUEUE.init(BBBuffer::new()).try_split().unwrap();
+    let (tcp_to_wisun_producer, mut tcp_to_wisun_consumer) =
+        TCP_TO_WISUN.init(BBBuffer::new()).try_split().unwrap();
+    let (mut wisun_to_tcp_producer, wisun_to_tcp_consumer) =
+        WISUN_TO_TCP.init(BBBuffer::new()).try_split().unwrap();
+    info!("queues: initialized");
 
     unwrap!(spawner.spawn(uart_reader(uart_rx, rx_producer)));
     unwrap!(spawner.spawn(uart_writer(uart_tx, tx_consumer)));
+    unwrap!(spawner.spawn(tcp_task(
+        stack,
+        tcp_to_wisun_producer,
+        wisun_to_tcp_consumer,
+    )));
+    info!("tasks: UART and TCP tasks started");
 
     // pana_auth(&mut writer, &mut rx);
 
     let mut manager = Bp35a1Manager::new(tx_producer, rx_consumer);
 
+    info!("Wi-SUN: starting PANA authentication");
     let remote_ipv6 = loop {
         match manager.pana_auth().await {
             Ok(ipv6) => break ipv6,
@@ -121,76 +324,64 @@ async fn main(spawner: Spawner) {
     };
 
     defmt::info!("pana_auth OK");
+    info!("Wi-SUN: PANA authentication completed");
 
-    let mut transaction_count = 0u16;
+    // TCPとWi-SUNのどちらか先に到着したパケットを転送する。
+    static TCP_PACKET: StaticCell<[u8; TCP_BUF_SIZE]> = StaticCell::new();
+    static WISUN_PACKET: StaticCell<[u8; TCP_BUF_SIZE]> = StaticCell::new();
+    let tcp_packet = TCP_PACKET.init([0u8; TCP_BUF_SIZE]);
+    let wisun_packet = WISUN_PACKET.init([0u8; TCP_BUF_SIZE]);
+    info!("bridge: TCP <-> Wi-SUN forwarding started");
     loop {
-        // send echonet packet and receive power data
-        let mut packet = ECHONET_LITE_FLAME.clone();
-        packet[TRANSACTION_INDEX_OFFSET..TRANSACTION_INDEX_OFFSET + 2]
-            .clone_from_slice(&transaction_count.to_be_bytes());
-
-        manager
-            .send_udp_packet(&packet, &remote_ipv6, 0x0E1A)
-            .await
-            .unwrap();
-
-        loop {
-            let mut buf = [0u8; 1024];
-            let size = manager.receive_udp_packet(&mut buf).await.unwrap();
-            defmt::debug!("{=[u8]:x}", &buf[..size]);
-
-            // parse echonet packet
-            let maybe_echonet_packet = &buf[..size];
-            if &maybe_echonet_packet[0..2] != ECHONET_LITE_HEADER_MAGIC {
-                // it is not echonet packet
-                defmt::debug!("packet is not echonet-lite");
-                embassy_futures::yield_now().await;
-                continue;
-            }
-            // check transaction ID
-            let tid = u16::from_be_bytes(
-                maybe_echonet_packet[TRANSACTION_INDEX_OFFSET..TRANSACTION_INDEX_OFFSET + 2]
-                    .try_into()
-                    .unwrap(),
-            );
-            if tid != transaction_count {
-                defmt::debug!("transaction id missmuch");
-                defmt::debug!("tdi {} != transaction_count {}", tid, transaction_count);
-                embassy_futures::yield_now().await;
-                continue;
+        match select(
+            receive_tcp_input(&mut tcp_to_wisun_consumer, &mut tcp_packet[..]),
+            manager.receive_udp_packet(&mut wisun_packet[..]),
+        )
+        .await
+        {
+            // PCから受信したデータは、そのままスマートメーターへ送る。
+            Either::First(size) => {
+                if size == 0 {
+                    continue;
+                }
+                debug!("bridge: TCP -> Wi-SUN ({} bytes)", size);
+                if manager
+                    .send_udp_packet(&tcp_packet[..size], &remote_ipv6, TCP_PORT)
+                    .await
+                    .is_err()
+                {
+                    warn!("Wi-SUN: failed to send UDP packet");
+                }
             }
 
-            // check ESV
-            let (index, esv) = RESP_GET_RESP_INDEX_OFFSET_AND_DATA;
-            if maybe_echonet_packet[index] != esv {
-                defmt::debug!("esv missmuch");
-                embassy_futures::yield_now().await;
-                continue;
+            // スマートメーターから受信したデータは、TCP接続がある場合だけ
+            // tcp_taskへ渡す。tcp_task側で接続がなければ送信されず破棄される。
+            Either::Second(Ok(size)) => {
+                if size == 0 {
+                    continue;
+                }
+                debug!("bridge: Wi-SUN -> TCP ({} bytes)", size);
+                loop {
+                    match wisun_to_tcp_producer.grant_exact(size) {
+                        Ok(mut grant) => {
+                            grant.buf().copy_from_slice(&wisun_packet[..size]);
+                            grant.commit(size);
+                            break;
+                        }
+                        Err(bbqueue::Error::InsufficientSize | bbqueue::Error::GrantInProgress) => {
+                            yield_now().await;
+                        }
+                        Err(bbqueue::Error::AlreadySplit) => {
+                            warn!("TCP queue is already split");
+                            break;
+                        }
+                    }
+                }
             }
-
-            // assume SEOJ, DEOJ, OPC, EPC, POC are valid
-            // TODO: check
-
-            let pdc_size = maybe_echonet_packet[RESP_PDC_OFFSET];
-            let pdc: u32 = match pdc_size {
-                1 => maybe_echonet_packet[RESP_POWER_CONSUMPTION_OFFSET].into(),
-                2 => u16::from_be_bytes(
-                    maybe_echonet_packet[RESP_POWER_CONSUMPTION_OFFSET..]
-                        .try_into()
-                        .unwrap(),
-                )
-                .into(),
-                _ => core::panic!("pdc too large"),
-            };
-            defmt::info!("total power consumption: {}W", pdc);
-            let mut latest_pc = LATEST_CURRENT_POWER_CONSUMPTION.lock().await;
-            *latest_pc = pdc;
-            break;
+            Either::Second(Err(_)) => {
+                warn!("Wi-SUN: failed to receive UDP packet");
+            }
         }
-
-        embassy_futures::yield_now().await;
-        transaction_count += 1;
-        embassy_time::Delay.delay_ms(1000 * 10);
     }
 }
 
@@ -206,7 +397,7 @@ async fn uart_reader(
             continue;
         }
         let size = uart_rx.read(&mut grant.buf()).await.unwrap();
-        // debug!("uart RX {=[u8]:a}", grant.buf()[..size]);
+        debug!("UART: received {} bytes", size);
         grant.commit(size);
     }
 }
@@ -234,6 +425,7 @@ async fn uart_writer(
         }
         debug!("TX {=[u8]:a}", grant.buf());
         let size = uart_tx.write(grant.buf()).await.unwrap();
+        debug!("UART: transmitted {} bytes", size);
         grant.release(size);
     }
 }
@@ -257,7 +449,11 @@ impl Bp35a1Manager {
         destination_address: &Ipv6Addr,
         destination_port: u16,
     ) -> Result<(), ()> {
-        defmt::debug!("send_udp_packet");
+        defmt::debug!(
+            "Wi-SUN TX: sending {} bytes to UDP port {}",
+            data.len(),
+            destination_port
+        );
         Bp35a1Command::udp_send(self, 1, destination_address, destination_port, true, data)
             .unwrap();
         // skip echo
@@ -283,6 +479,7 @@ impl Bp35a1Manager {
             _ => return Err(()),
         };
 
+        defmt::debug!("Wi-SUN TX: send completed");
         Ok(())
     }
 
@@ -301,6 +498,7 @@ impl Bp35a1Manager {
                         buf[i] = byte;
                     }
                     grant.release(size * 2 + 2);
+                    defmt::debug!("Wi-SUN RX: received {} bytes", size);
                     break size;
                 }
                 _ => {
@@ -406,8 +604,9 @@ impl Bp35a1Manager {
     }
 
     pub async fn pana_auth(&mut self) -> Result<Ipv6Addr, ()> {
-        defmt::trace!("start pana_auth");
+        defmt::info!("PANA: authentication sequence started");
         // set id/password
+        defmt::debug!("PANA: setting credentials");
         Bp35a1Command::set_password(self, BROUTE_PASSWORD).unwrap();
         Bp35a1Command::set_rbid(self, BROUTE_ID).unwrap();
         // check response
@@ -415,6 +614,7 @@ impl Bp35a1Manager {
         self.check_response().await.unwrap();
 
         // TODO:scan
+        defmt::info!("PANA: scanning for smart meter");
         let pan_desc = loop {
             Bp35a1Command::scan(self, 3).unwrap();
             self.check_response().await.unwrap();
@@ -440,6 +640,7 @@ impl Bp35a1Manager {
 
             match self.receive_bp35a1_packet().await.unwrap() {
                 Bp35a1Packet::PanDescription(desc) => {
+                    defmt::info!("PANA: PAN description received");
                     break desc;
                 }
                 _e => {
@@ -475,6 +676,7 @@ impl Bp35a1Manager {
         }
 
         // get address
+        defmt::debug!("PANA: requesting IPv6 address");
         Bp35a1Command::skll64(self, pan_desc.mac_address).unwrap();
         // skip echoback
         let _ = self.receive_bp35a1_packet().await.unwrap();
@@ -511,10 +713,12 @@ impl Bp35a1Manager {
             };
             let used_size = buf.len() - r.len();
             grant.release(used_size);
+            defmt::info!("PANA: IPv6 address received");
             break ipv6;
         };
 
         // set channel
+        defmt::debug!("PANA: configuring channel and PAN ID");
         Bp35a1Command::set_sreg(self, &Sreg::S2(pan_desc.channel)).unwrap();
         // set PanID
         Bp35a1Command::set_sreg(self, &Sreg::S3(pan_desc.pan_id)).unwrap();
@@ -523,6 +727,7 @@ impl Bp35a1Manager {
         self.check_response().await.unwrap();
 
         // skjoin
+        defmt::info!("PANA: joining smart meter");
         Bp35a1Command::join(self, &ipv6).unwrap();
         self.check_response().await.unwrap();
         // check event
@@ -531,10 +736,12 @@ impl Bp35a1Manager {
                 Bp35a1Packet::Event(event) => match &event.number {
                     EventNumber::PanaConnectionFail => {
                         // pana auth error
+                        defmt::warn!("PANA: connection failed");
                         return Err(());
                     }
                     EventNumber::PanaConnectionSuccess => {
                         // pana auth ok
+                        defmt::info!("PANA: connection succeeded");
                         return Ok(ipv6);
                     }
                     EventNumber::UdpSendFinish => {
