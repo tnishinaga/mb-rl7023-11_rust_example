@@ -4,12 +4,12 @@
 #![no_std]
 #![no_main]
 
-use core::net::Ipv6Addr;
-use core::str::{self};
 use bbqueue::{BBBuffer, Consumer, Producer};
 use bp35a1::command::Sreg;
 use bp35a1::parser::{Bp35a1Parser, EventNumber};
 use bp35a1::{command::Bp35a1Command, parser::Bp35a1Packet};
+use core::net::Ipv6Addr;
+use core::str::{self};
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
@@ -19,30 +19,34 @@ use embassy_net_wiznet::chip::W5500;
 use embassy_net_wiznet::{Device, Runner, State};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
+use embassy_rp::dma;
 use embassy_rp::gpio::Level;
 use embassy_rp::gpio::Output;
 use embassy_rp::gpio::{Input, Pull};
-use embassy_rp::peripherals::{SPI0, UART0};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, SPI0, UART0};
 use embassy_rp::spi::{Async, Config as SpiConfig, Spi};
-use embassy_rp::uart::BufferedUartTx;
-use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartRx, Config};
+use embassy_rp::uart::{
+    Config, Error as UartError, InterruptHandler as UartInterruptHandler, Uart, UartRx, UartTx,
+};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal_1::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
-use embedded_io_async::{Read, Write};
-use rand::RngCore;
+use embedded_io_async::Write;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
-    UART0_IRQ => BufferedInterruptHandler<UART0>;
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>, dma::InterruptHandler<DMA_CH2>, dma::InterruptHandler<DMA_CH3>;
+    UART0_IRQ => UartInterruptHandler<UART0>;
 });
 
 // include credential info
 include!("broute_credential.rs");
 
 const UART_BUF: usize = 1024 * 2;
-
+// Stop a DMA read after a short idle period so variable-length BP35A1 lines
+// are delivered without waiting for a fixed-size transfer to fill.
+const UART_DMA_IDLE_US: u64 = 1_000;
 const UART_QUEUE_SIZE: usize = UART_BUF * 2;
 static UART_RX_QUEUE: StaticCell<BBBuffer<UART_QUEUE_SIZE>> = StaticCell::new();
 static UART_TX_QUEUE: StaticCell<BBBuffer<UART_QUEUE_SIZE>> = StaticCell::new();
@@ -69,14 +73,15 @@ async fn ethernet_task(
 }
 
 #[embassy_executor::task]
-async fn net_task(stack: &'static Stack<Device<'static>>) -> ! {
+async fn net_task(runner: embassy_net::Runner<'static, Device<'static>>) -> ! {
     info!("network: task started");
-    stack.run().await
+    let mut runner = runner;
+    runner.run().await
 }
 
 #[embassy_executor::task]
 async fn tcp_task(
-    stack: &'static Stack<Device<'static>>,
+    stack: &'static Stack<'static>,
     mut from_pc: Producer<'static, TCP_QUEUE_SIZE>,
     mut to_pc: Consumer<'static, TCP_QUEUE_SIZE>,
 ) -> ! {
@@ -89,7 +94,7 @@ async fn tcp_task(
     let buf = TCP_BUF.init([0u8; TCP_BUF_SIZE]);
     loop {
         let mut socket =
-            embassy_net::tcp::TcpSocket::new(stack, &mut rx_storage[..], &mut tx_storage[..]);
+            embassy_net::tcp::TcpSocket::new(*stack, &mut rx_storage[..], &mut tx_storage[..]);
         info!("TCP: listening on port {}", TCP_PORT);
         if socket.accept(TCP_PORT).await.is_err() {
             warn!("TCP: accept failed");
@@ -183,7 +188,7 @@ async fn main(spawner: Spawner) {
     spi_config.frequency = 50_000_000;
     info!("W5500: configuring SPI0 at 50 MHz");
     let spi = Spi::new(
-        p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, p.DMA_CH0, p.DMA_CH1, spi_config,
+        p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, p.DMA_CH0, p.DMA_CH1, Irqs, spi_config,
     );
     info!("W5500: configuring CS/INT/RESET pins");
     let cs = Output::new(p.PIN_17, Level::High);
@@ -204,13 +209,13 @@ async fn main(spawner: Spawner) {
     .unwrap();
     info!("W5500: initialized");
     info!("W5500: spawning ethernet runner");
-    unwrap!(spawner.spawn(ethernet_task(runner)));
+    spawner.spawn(unwrap!(ethernet_task(runner)));
 
-    static STACK: StaticCell<Stack<Device<'static>>> = StaticCell::new();
+    static STACK: StaticCell<Stack<'static>> = StaticCell::new();
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     info!("network: creating IPv4 stack");
     let mut rng = RoscRng;
-    let stack = &*STACK.init(Stack::new(
+    let (stack, net_runner) = embassy_net::new(
         device,
         embassy_net::Config::ipv4_static(StaticConfigV4 {
             address: Ipv4Cidr::new(Ipv4Address::new(192, 168, 200, 200), 24),
@@ -219,9 +224,10 @@ async fn main(spawner: Spawner) {
         }),
         RESOURCES.init(StackResources::new()),
         rng.next_u64(),
-    ));
+    );
+    let stack = STACK.init(stack);
     info!("network: IPv4 stack created");
-    unwrap!(spawner.spawn(net_task(stack)));
+    spawner.spawn(unwrap!(net_task(net_runner)));
     info!("network: configured as 192.168.200.200/24");
 
     // reset
@@ -238,18 +244,19 @@ async fn main(spawner: Spawner) {
     let (tx_pin, rx_pin, uart) = (p.PIN_0, p.PIN_1, p.UART0);
     info!("UART: configuring UART0");
 
-    static TX_BUF: StaticCell<[u8; UART_BUF]> = StaticCell::new();
-    let tx_buf = &mut TX_BUF.init([0; UART_BUF])[..];
-    static RX_BUF: StaticCell<[u8; UART_BUF]> = StaticCell::new();
-    let rx_buf = &mut RX_BUF.init([0; UART_BUF])[..];
-    let uart = BufferedUart::new(
+    let uart_config = Config::default();
+    info!(
+        "UART: DMA baudrate={} data_bits=8 stop_bits=1 parity=none; idle_timeout_us={} queue={}",
+        uart_config.baudrate, UART_DMA_IDLE_US, UART_QUEUE_SIZE
+    );
+    let uart = Uart::new(
         uart,
-        Irqs,
         tx_pin,
         rx_pin,
-        tx_buf,
-        rx_buf,
-        Config::default(),
+        Irqs,
+        p.DMA_CH2,
+        p.DMA_CH3,
+        uart_config,
     );
     info!("UART: initialized");
     let (uart_tx, uart_rx) = uart.split();
@@ -262,9 +269,9 @@ async fn main(spawner: Spawner) {
         WISUN_TO_TCP.init(BBBuffer::new()).try_split().unwrap();
     info!("queues: initialized");
 
-    unwrap!(spawner.spawn(uart_reader(uart_rx, rx_producer)));
-    unwrap!(spawner.spawn(uart_writer(uart_tx, tx_consumer)));
-    unwrap!(spawner.spawn(tcp_task(
+    spawner.spawn(unwrap!(uart_reader(uart_rx, rx_producer)));
+    spawner.spawn(unwrap!(uart_writer(uart_tx, tx_consumer)));
+    spawner.spawn(unwrap!(tcp_task(
         stack,
         tcp_to_wisun_producer,
         wisun_to_tcp_consumer,
@@ -351,26 +358,118 @@ async fn main(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn uart_reader(
-    mut uart_rx: BufferedUartRx<'static, UART0>,
+    mut uart_rx: UartRx<'static, embassy_rp::uart::Async>,
     mut queue: Producer<'static, UART_QUEUE_SIZE>,
 ) {
+    info!(
+        "UART RX: DMA reader task started (idle_timeout_us={})",
+        UART_DMA_IDLE_US
+    );
+    let mut error_count = 0u32;
+    let mut queue_waits = 0u32;
     loop {
-        let mut grant = queue.grant_max_remaining(UART_BUF).unwrap();
-        if grant.is_empty() {
-            embassy_futures::yield_now().await;
-            continue;
+        let mut grant = match queue.grant_max_remaining(UART_BUF) {
+            Ok(grant) => grant,
+            Err(bbqueue::Error::InsufficientSize | bbqueue::Error::GrantInProgress) => {
+                queue_waits += 1;
+                if queue_waits == 1 || queue_waits % 128 == 0 {
+                    warn!(
+                        "UART RX DMA: software queue full (waits={}, capacity={}); consumer is behind",
+                        queue_waits, UART_QUEUE_SIZE
+                    );
+                }
+                yield_now().await;
+                continue;
+            }
+            Err(bbqueue::Error::AlreadySplit) => {
+                warn!("UART RX: queue is no longer available");
+                yield_now().await;
+                continue;
+            }
+        };
+        let capacity = grant.buf().len();
+        // BP35A1 packets are ASCII. The sentinel lets us determine how many
+        // bytes DMA wrote when the idle timeout aborts a partially-filled DMA
+        // transfer.
+        grant.buf().fill(0xff);
+        match select(
+            uart_rx.read(grant.buf()),
+            Timer::after(Duration::from_micros(UART_DMA_IDLE_US)),
+        )
+        .await
+        {
+            Either::First(Ok(())) => {
+                debug!("UART RX DMA: received {} bytes", capacity);
+                grant.commit(capacity);
+            }
+            Either::Second(_) => {
+                let size = grant
+                    .buf()
+                    .iter()
+                    .position(|byte| *byte == 0xff)
+                    .unwrap_or(capacity);
+                if size == 0 {
+                    grant.commit(0);
+                    continue;
+                }
+                debug!("UART RX DMA: received {} bytes before idle", size);
+                grant.commit(size);
+            }
+            Either::First(Err(UartError::Overrun)) => {
+                error_count += 1;
+                warn!(
+                    "UART RX DMA: OVERRUN #{}; hardware FIFO/shift register overflowed",
+                    error_count
+                );
+                grant.commit(0);
+                yield_now().await;
+            }
+            Either::First(Err(UartError::Break)) => {
+                error_count += 1;
+                warn!(
+                    "UART RX DMA: BREAK error #{}; dropping this read",
+                    error_count
+                );
+                grant.commit(0);
+                yield_now().await;
+            }
+            Either::First(Err(UartError::Parity)) => {
+                error_count += 1;
+                warn!(
+                    "UART RX DMA: PARITY error #{}; dropping this read",
+                    error_count
+                );
+                grant.commit(0);
+                yield_now().await;
+            }
+            Either::First(Err(UartError::Framing)) => {
+                error_count += 1;
+                warn!(
+                    "UART RX DMA: FRAMING error #{}; dropping this read",
+                    error_count
+                );
+                grant.commit(0);
+                yield_now().await;
+            }
+            Either::First(Err(_)) => {
+                error_count += 1;
+                warn!(
+                    "UART RX DMA: unknown serial error #{}; dropping this read",
+                    error_count
+                );
+                grant.commit(0);
+                yield_now().await;
+            }
         }
-        let size = uart_rx.read(&mut grant.buf()).await.unwrap();
-        debug!("UART: received {} bytes", size);
-        grant.commit(size);
     }
 }
 
 #[embassy_executor::task]
 async fn uart_writer(
-    mut uart_tx: BufferedUartTx<'static, UART0>,
+    mut uart_tx: UartTx<'static, embassy_rp::uart::Async>,
     mut queue: Consumer<'static, UART_QUEUE_SIZE>,
 ) {
+    info!("UART TX: DMA writer task started");
     loop {
         let grant = match queue.read() {
             Ok(ok) => Ok(ok),
@@ -388,9 +487,33 @@ async fn uart_writer(
             continue;
         }
         debug!("TX {=[u8]:a}", grant.buf());
-        let size = uart_tx.write(grant.buf()).await.unwrap();
-        debug!("UART: transmitted {} bytes", size);
-        grant.release(size);
+        let size = grant.buf().len();
+        match uart_tx.write(grant.buf()).await {
+            Ok(()) => {
+                debug!("UART TX DMA: transmitted {} bytes", size);
+                grant.release(size);
+            }
+            Err(UartError::Overrun) => {
+                warn!("UART TX DMA: overrun error; dropping {} bytes", size);
+                grant.release(0);
+            }
+            Err(UartError::Break) => {
+                warn!("UART TX DMA: break error; dropping {} bytes", size);
+                grant.release(0);
+            }
+            Err(UartError::Parity) => {
+                warn!("UART TX DMA: parity error; dropping {} bytes", size);
+                grant.release(0);
+            }
+            Err(UartError::Framing) => {
+                warn!("UART TX DMA: framing error; dropping {} bytes", size);
+                grant.release(0);
+            }
+            Err(_) => {
+                warn!("UART TX DMA: unknown error; dropping {} bytes", size);
+                grant.release(0);
+            }
+        }
     }
 }
 
@@ -738,7 +861,7 @@ impl bp35a1::write::ByteWrite for Bp35a1Manager {
 }
 
 impl embedded_nal_async::UnconnectedUdp for Bp35a1Manager {
-    type Error = embedded_io_async::ErrorKind;
+    type Error = embedded_io_async_06::ErrorKind;
 
     async fn send(
         &mut self,
