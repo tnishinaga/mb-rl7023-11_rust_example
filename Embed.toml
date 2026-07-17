@@ -1,6 +1,11 @@
+# Assisted-by: Codex:GPT-5.6 Luna
+
 [default.probe]
 protocol = "Swd"
 speed = 20000
+usb_vid = "2e8a"
+usb_pid = "000c"
+serial = "E6614103E7688E25"
 # If you only have one probe cargo embed will pick automatically
 # Otherwise: add your probe's VID/PID/serial to filter
 
@@ -26,13 +31,13 @@ connect_under_reset = false
 [default.rtt]
 enabled = true
 up_mode = "NoBlockSkip"
-channels = [
-    { up = 0, down = 0, name = "name", up_mode = "NoBlockSkip", format = "Defmt" },
+up_channels = [
+    { channel = 0, name = "defmt", up_mode = "NoBlockSkip", format = "Defmt" },
 ]
 timeout = 3000
-show_timestamps = true
-log_enabled = false
+log_enabled = true
 log_path = "./logs"
+
 
 [default.gdb]
 enabled = false
