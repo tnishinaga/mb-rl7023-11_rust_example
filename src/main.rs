@@ -9,7 +9,7 @@ use bp35a1::command::Sreg;
 use bp35a1::parser::{Bp35a1Parser, EventNumber};
 use bp35a1::{command::Bp35a1Command, parser::Bp35a1Packet};
 use core::net::Ipv6Addr;
-use core::str::{self};
+use core::str::{self, FromStr};
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
@@ -29,7 +29,6 @@ use embassy_rp::uart::{
     Config, Error as UartError, InterruptHandler as UartInterruptHandler, Uart, UartRx, UartTx,
 };
 use embassy_time::{Delay, Duration, Timer};
-use embedded_hal_1::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_io_async::Write;
 use static_cell::StaticCell;
@@ -55,8 +54,14 @@ const TCP_BUF_SIZE: usize = 1024;
 const TCP_QUEUE_SIZE: usize = TCP_BUF_SIZE;
 static TCP_TO_WISUN: StaticCell<BBBuffer<TCP_QUEUE_SIZE>> = StaticCell::new();
 static WISUN_TO_TCP: StaticCell<BBBuffer<TCP_QUEUE_SIZE>> = StaticCell::new();
+const IPV6_RESPONSE_BUFFER_SIZE: usize = 64;
+static IPV6_RESPONSE_BUFFER: StaticCell<[u8; IPV6_RESPONSE_BUFFER_SIZE]> = StaticCell::new();
 
 const TCP_PORT: u16 = 3610;
+const WISUN_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const WISUN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const WISUN_PANA_TIMEOUT: Duration = Duration::from_secs(60);
+const WISUN_RECOVERY_ATTEMPTS: u8 = 3;
 
 #[embassy_executor::task]
 async fn ethernet_task(
@@ -179,6 +184,92 @@ async fn receive_tcp_input(
     }
 }
 
+async fn reset_wisun_module(reset_pin: &mut Output<'static>) {
+    warn!("Wi-SUN: asserting reset pin");
+    reset_pin.set_low();
+    Timer::after(Duration::from_millis(1000)).await;
+    info!("Wi-SUN: releasing reset pin");
+    reset_pin.set_high();
+    Timer::after(Duration::from_millis(1000)).await;
+    info!("Wi-SUN: reset sequence completed");
+}
+
+async fn establish_wisun(
+    manager: &mut Bp35a1Manager,
+    reset_pin: &mut Output<'static>,
+    reset_before_first_attempt: bool,
+    ipv6_buffer: &mut [u8],
+) -> Result<Ipv6Addr, ()> {
+    for attempt in 1..=WISUN_RECOVERY_ATTEMPTS {
+        if attempt > 1 || (attempt == 1 && reset_before_first_attempt) {
+            info!(
+                "Wi-SUN: resetting before PANA reconnect (attempt {}/{})",
+                attempt, WISUN_RECOVERY_ATTEMPTS
+            );
+            reset_wisun_module(reset_pin).await;
+            manager.discard_uart_rx().await;
+        }
+
+        info!(
+            "Wi-SUN: starting PANA authentication (attempt {}/{})",
+            attempt, WISUN_RECOVERY_ATTEMPTS
+        );
+        match select(
+            manager.pana_auth(ipv6_buffer),
+            Timer::after(WISUN_PANA_TIMEOUT),
+        )
+        .await
+        {
+            Either::First(Ok(ipv6)) => {
+                info!("Wi-SUN: PANA authentication completed");
+                return Ok(ipv6);
+            }
+            Either::First(Err(_)) => {
+                warn!("Wi-SUN: PANA authentication failed");
+            }
+            Either::Second(_) => {
+                warn!("Wi-SUN: PANA authentication timed out");
+            }
+        }
+    }
+
+    Err(())
+}
+
+async fn wait_for_human_restart() -> ! {
+    error!("Wi-SUN: recovery failed; please restart the microcontroller and smart-meter path");
+    loop {
+        Timer::after(Duration::from_secs(60)).await;
+    }
+}
+
+async fn forward_wisun_to_tcp(
+    producer: &mut Producer<'static, TCP_QUEUE_SIZE>,
+    packet: &[u8],
+    size: usize,
+) {
+    if size == 0 {
+        return;
+    }
+    debug!("bridge: Wi-SUN -> TCP ({} bytes)", size);
+    loop {
+        match producer.grant_exact(size) {
+            Ok(mut grant) => {
+                grant.buf().copy_from_slice(&packet[..size]);
+                grant.commit(size);
+                break;
+            }
+            Err(bbqueue::Error::InsufficientSize | bbqueue::Error::GrantInProgress) => {
+                yield_now().await;
+            }
+            Err(bbqueue::Error::AlreadySplit) => {
+                warn!("TCP queue is already split");
+                break;
+            }
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -231,15 +322,9 @@ async fn main(spawner: Spawner) {
     info!("network: configured as 192.168.200.200/24");
 
     // reset
-    info!("Wi-SUN: resetting module");
+    info!("Wi-SUN: initializing reset pin");
     let mut reset_pin = Output::new(p.PIN_15, Level::High);
-    info!("Wi-SUN: asserting reset");
-    reset_pin.set_low();
-    embassy_time::Delay.delay_ms(1000);
-    info!("Wi-SUN: releasing reset");
-    reset_pin.set_high();
-    embassy_time::Delay.delay_ms(1000);
-    info!("Wi-SUN: reset complete");
+    reset_wisun_module(&mut reset_pin).await;
 
     let (tx_pin, rx_pin, uart) = (p.PIN_0, p.PIN_1, p.UART0);
     info!("UART: configuring UART0");
@@ -281,21 +366,13 @@ async fn main(spawner: Spawner) {
     // pana_auth(&mut writer, &mut rx);
 
     let mut manager = Bp35a1Manager::new(tx_producer, rx_consumer);
+    let ipv6_buffer = IPV6_RESPONSE_BUFFER.init([0u8; IPV6_RESPONSE_BUFFER_SIZE]);
 
-    info!("Wi-SUN: starting PANA authentication");
-    let remote_ipv6 = loop {
-        match manager.pana_auth().await {
-            Ok(ipv6) => break ipv6,
-            Err(_) => (),
-        }
-
-        defmt::info!("pana_auth NG");
-
-        core::todo!("retry");
-    };
-
-    defmt::info!("pana_auth OK");
-    info!("Wi-SUN: PANA authentication completed");
+    let mut remote_ipv6 =
+        match establish_wisun(&mut manager, &mut reset_pin, false, ipv6_buffer).await {
+            Ok(ipv6) => ipv6,
+            Err(_) => wait_for_human_restart().await,
+        };
 
     // TCPとWi-SUNのどちらか先に到着したパケットを転送する。
     static TCP_PACKET: StaticCell<[u8; TCP_BUF_SIZE]> = StaticCell::new();
@@ -316,41 +393,104 @@ async fn main(spawner: Spawner) {
                     continue;
                 }
                 debug!("bridge: TCP -> Wi-SUN ({} bytes)", size);
-                if manager
-                    .send_udp_packet(&tcp_packet[..size], &remote_ipv6, TCP_PORT)
-                    .await
-                    .is_err()
+                match select(
+                    manager.send_udp_packet(&tcp_packet[..size], &remote_ipv6, TCP_PORT),
+                    Timer::after(WISUN_COMMAND_TIMEOUT),
+                )
+                .await
                 {
-                    warn!("Wi-SUN: failed to send UDP packet");
+                    Either::First(Ok(())) => {
+                        // The BP35A1 command acknowledgement only confirms
+                        // that the packet was handed to the Wi-SUN radio.
+                        // The smart-meter response is a separate ERXUDP
+                        // packet and must have its own timeout.
+                        match select(
+                            manager.receive_udp_packet(&mut wisun_packet[..]),
+                            Timer::after(WISUN_RESPONSE_TIMEOUT),
+                        )
+                        .await
+                        {
+                            Either::First(Ok(response_size)) => {
+                                forward_wisun_to_tcp(
+                                    &mut wisun_to_tcp_producer,
+                                    &wisun_packet[..],
+                                    response_size,
+                                )
+                                .await;
+                            }
+                            Either::First(Err(_)) => {
+                                warn!(
+                                    "Wi-SUN: failed while waiting for smart-meter response; starting module recovery"
+                                );
+                                remote_ipv6 = match establish_wisun(
+                                    &mut manager,
+                                    &mut reset_pin,
+                                    true,
+                                    ipv6_buffer,
+                                )
+                                .await
+                                {
+                                    Ok(ipv6) => ipv6,
+                                    Err(_) => wait_for_human_restart().await,
+                                };
+                            }
+                            Either::Second(_) => {
+                                error!(
+                                    "Wi-SUN: smart-meter response timed out after {} seconds; starting module recovery",
+                                    WISUN_RESPONSE_TIMEOUT.as_secs()
+                                );
+                                remote_ipv6 = match establish_wisun(
+                                    &mut manager,
+                                    &mut reset_pin,
+                                    true,
+                                    ipv6_buffer,
+                                )
+                                .await
+                                {
+                                    Ok(ipv6) => ipv6,
+                                    Err(_) => wait_for_human_restart().await,
+                                };
+                            }
+                        }
+                    }
+                    Either::First(Err(_)) => {
+                        warn!("Wi-SUN: send command failed; starting module recovery");
+                        remote_ipv6 =
+                            match establish_wisun(&mut manager, &mut reset_pin, true, ipv6_buffer)
+                                .await
+                            {
+                                Ok(ipv6) => ipv6,
+                                Err(_) => wait_for_human_restart().await,
+                            };
+                    }
+                    Either::Second(_) => {
+                        error!(
+                            "Wi-SUN: send command timed out after {} seconds; starting module recovery",
+                            WISUN_COMMAND_TIMEOUT.as_secs()
+                        );
+                        remote_ipv6 =
+                            match establish_wisun(&mut manager, &mut reset_pin, true, ipv6_buffer)
+                                .await
+                            {
+                                Ok(ipv6) => ipv6,
+                                Err(_) => wait_for_human_restart().await,
+                            };
+                    }
                 }
             }
 
             // スマートメーターから受信したデータは、TCP接続がある場合だけ
             // tcp_taskへ渡す。tcp_task側で接続がなければ送信されず破棄される。
             Either::Second(Ok(size)) => {
-                if size == 0 {
-                    continue;
-                }
-                debug!("bridge: Wi-SUN -> TCP ({} bytes)", size);
-                loop {
-                    match wisun_to_tcp_producer.grant_exact(size) {
-                        Ok(mut grant) => {
-                            grant.buf().copy_from_slice(&wisun_packet[..size]);
-                            grant.commit(size);
-                            break;
-                        }
-                        Err(bbqueue::Error::InsufficientSize | bbqueue::Error::GrantInProgress) => {
-                            yield_now().await;
-                        }
-                        Err(bbqueue::Error::AlreadySplit) => {
-                            warn!("TCP queue is already split");
-                            break;
-                        }
-                    }
-                }
+                forward_wisun_to_tcp(&mut wisun_to_tcp_producer, &wisun_packet[..], size).await;
             }
             Either::Second(Err(_)) => {
-                warn!("Wi-SUN: failed to receive UDP packet");
+                warn!("Wi-SUN: failed to receive UDP packet; starting module recovery");
+                remote_ipv6 =
+                    match establish_wisun(&mut manager, &mut reset_pin, true, ipv6_buffer).await {
+                        Ok(ipv6) => ipv6,
+                        Err(_) => wait_for_human_restart().await,
+                    };
             }
         }
     }
@@ -530,6 +670,31 @@ impl Bp35a1Manager {
         Self { uart_tx, uart_rx }
     }
 
+    async fn discard_uart_rx(&mut self) {
+        let mut discarded = 0;
+        loop {
+            match self.uart_rx.read() {
+                Ok(grant) => {
+                    let size = grant.buf().len();
+                    discarded += size;
+                    grant.release(size);
+                }
+                Err(bbqueue::Error::InsufficientSize | bbqueue::Error::GrantInProgress) => break,
+                Err(bbqueue::Error::AlreadySplit) => {
+                    warn!("Wi-SUN: UART RX queue is already split while draining");
+                    break;
+                }
+            }
+        }
+        if discarded != 0 {
+            warn!(
+                "Wi-SUN: discarded {} stale UART RX bytes after reset",
+                discarded
+            );
+        }
+        yield_now().await;
+    }
+
     async fn send_udp_packet(
         &mut self,
         data: &[u8],
@@ -542,7 +707,7 @@ impl Bp35a1Manager {
             destination_port
         );
         Bp35a1Command::udp_send(self, 1, destination_address, destination_port, true, data)
-            .unwrap();
+            .map_err(|_| ())?;
         // skip echo
         defmt::debug!("skip echo");
         match self.receive_bp35a1_packet().await? {
@@ -561,10 +726,14 @@ impl Bp35a1Manager {
         }
         // check OK
         defmt::debug!("check ok");
-        let _ = match self.receive_bp35a1_packet().await? {
-            Bp35a1Packet::Response(resp) => resp.unwrap(),
+        match self.receive_bp35a1_packet().await? {
+            Bp35a1Packet::Response(Ok(())) => {}
+            Bp35a1Packet::Response(Err(code)) => {
+                warn!("Wi-SUN TX: module returned FAIL ER{}", code);
+                return Err(());
+            }
             _ => return Err(()),
-        };
+        }
 
         defmt::debug!("Wi-SUN TX: send completed");
         Ok(())
@@ -574,14 +743,23 @@ impl Bp35a1Manager {
     async fn receive_udp_packet(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
         defmt::debug!("receive_udp_packet");
         let size = loop {
-            match self.receive_bp35a1_packet().await.unwrap() {
+            match self.receive_bp35a1_packet().await? {
                 Bp35a1Packet::UdpPacket(udp_packet) => {
                     // convert hex string to u8 array
                     let size = udp_packet.data_size;
-                    let grant = self.uart_rx.read().unwrap();
+                    if size > buf.len() {
+                        warn!(
+                            "Wi-SUN RX: packet too large ({} bytes, buffer {} bytes)",
+                            size,
+                            buf.len()
+                        );
+                        return Err(());
+                    }
+                    let grant = self.uart_rx.read().map_err(|_| ())?;
                     let packet_hexstring = &grant.buf()[..size * 2];
                     for (i, p) in packet_hexstring.chunks(2).enumerate() {
-                        let byte = u8::from_str_radix(str::from_utf8(p).unwrap(), 16).unwrap();
+                        let text = str::from_utf8(p).map_err(|_| ())?;
+                        let byte = u8::from_str_radix(text, 16).map_err(|_| ())?;
                         buf[i] = byte;
                     }
                     grant.release(size * 2 + 2);
@@ -607,6 +785,46 @@ impl Bp35a1Manager {
         }
 
         Ok(())
+    }
+
+    async fn receive_ipv6_address(&mut self, buffer: &mut [u8]) -> Result<Ipv6Addr, ()> {
+        let mut used = 0;
+        loop {
+            let grant = match self.uart_rx.read() {
+                Ok(grant) => grant,
+                Err(bbqueue::Error::InsufficientSize | bbqueue::Error::GrantInProgress) => {
+                    yield_now().await;
+                    continue;
+                }
+                Err(bbqueue::Error::AlreadySplit) => return Err(()),
+            };
+
+            let mut consumed = 0;
+            let mut complete = false;
+            for &byte in grant.buf() {
+                if used == buffer.len() {
+                    grant.release(consumed);
+                    warn!("PANA: IPv6 response exceeded {} bytes", buffer.len());
+                    return Err(());
+                }
+                buffer[used] = byte;
+                used += 1;
+                consumed += 1;
+                if used >= 2 && buffer[used - 2..used] == *b"\r\n" {
+                    complete = true;
+                    break;
+                }
+            }
+            grant.release(consumed);
+
+            if complete {
+                let address = str::from_utf8(&buffer[..used - 2]).map_err(|_| ())?;
+                let ipv6 = Ipv6Addr::from_str(address).map_err(|_| ())?;
+                info!("PANA: IPv6 address received: {}", address);
+                return Ok(ipv6);
+            }
+            yield_now().await;
+        }
     }
 
     async fn receive_bp35a1_packet_inner(&mut self) -> Result<Option<Bp35a1Packet>, ()> {
@@ -667,24 +885,24 @@ impl Bp35a1Manager {
         }
     }
 
-    pub async fn pana_auth(&mut self) -> Result<Ipv6Addr, ()> {
+    pub async fn pana_auth(&mut self, ipv6_buffer: &mut [u8]) -> Result<Ipv6Addr, ()> {
         defmt::info!("PANA: authentication sequence started");
         // set id/password
         defmt::debug!("PANA: setting credentials");
-        Bp35a1Command::set_password(self, BROUTE_PASSWORD).unwrap();
-        Bp35a1Command::set_rbid(self, BROUTE_ID).unwrap();
+        Bp35a1Command::set_password(self, BROUTE_PASSWORD).map_err(|_| ())?;
+        Bp35a1Command::set_rbid(self, BROUTE_ID).map_err(|_| ())?;
         // check response
-        self.check_response().await.unwrap();
-        self.check_response().await.unwrap();
+        self.check_response().await?;
+        self.check_response().await?;
 
         // TODO:scan
         defmt::info!("PANA: scanning for smart meter");
         let pan_desc = loop {
-            Bp35a1Command::scan(self, 3).unwrap();
-            self.check_response().await.unwrap();
+            Bp35a1Command::scan(self, 3).map_err(|_| ())?;
+            self.check_response().await?;
 
             // beaconを受信したらpan descriptionが来る
-            match self.receive_bp35a1_packet().await.unwrap() {
+            match self.receive_bp35a1_packet().await? {
                 Bp35a1Packet::Event(event) => match &event.number {
                     EventNumber::ActiveScanFinish => {
                         // not found?
@@ -696,13 +914,13 @@ impl Bp35a1Manager {
                     }
                     _e => {
                         defmt::info!("recv {:?}", defmt::Debug2Format(_e));
-                        core::unreachable!()
+                        return Err(());
                     }
                 },
-                _ => core::unreachable!(),
+                _ => return Err(()),
             }
 
-            match self.receive_bp35a1_packet().await.unwrap() {
+            match self.receive_bp35a1_packet().await? {
                 Bp35a1Packet::PanDescription(desc) => {
                     defmt::info!("PANA: PAN description received");
                     break desc;
@@ -720,7 +938,7 @@ impl Bp35a1Manager {
         loop {
             defmt::info!("wait scan finish");
 
-            match self.receive_bp35a1_packet().await.unwrap() {
+            match self.receive_bp35a1_packet().await? {
                 Bp35a1Packet::Event(event) => match &event.number {
                     EventNumber::ActiveScanFinish => {
                         break;
@@ -741,62 +959,29 @@ impl Bp35a1Manager {
 
         // get address
         defmt::debug!("PANA: requesting IPv6 address");
-        Bp35a1Command::skll64(self, pan_desc.mac_address).unwrap();
+        Bp35a1Command::skll64(self, pan_desc.mac_address).map_err(|_| ())?;
         // skip echoback
-        let _ = self.receive_bp35a1_packet().await.unwrap();
+        let _ = self.receive_bp35a1_packet().await?;
 
-        // get adress
-        // TODO: check_responseと一部コードを共通化する
-        let ipv6 = loop {
-            let grant = match self.uart_rx.read() {
-                Ok(ok) => Ok(ok),
-                Err(e) => match e {
-                    bbqueue::Error::InsufficientSize | bbqueue::Error::GrantInProgress => {
-                        embassy_futures::yield_now().await;
-                        continue;
-                    }
-                    bbqueue::Error::AlreadySplit => Err(bbqueue::Error::AlreadySplit),
-                },
-            }
-            .unwrap();
-            let buf = grant.buf();
-            info!("buf {=[u8]:a}", buf);
-
-            let (r, ipv6) = match bp35a1::parser::skell64_parser(buf) {
-                Ok((t, p)) => (t, p),
-                Err(e) => match e {
-                    nom::Err::Incomplete(_) => {
-                        embassy_futures::yield_now().await;
-                        continue;
-                    }
-                    _ => {
-                        debug!("parse error: {:?}", defmt::Debug2Format(&e));
-                        return Err(());
-                    }
-                },
-            };
-            let used_size = buf.len() - r.len();
-            grant.release(used_size);
-            defmt::info!("PANA: IPv6 address received");
-            break ipv6;
-        };
+        // The IPv6 line can be split across several DMA queue grants.
+        let ipv6 = self.receive_ipv6_address(ipv6_buffer).await?;
 
         // set channel
         defmt::debug!("PANA: configuring channel and PAN ID");
-        Bp35a1Command::set_sreg(self, &Sreg::S2(pan_desc.channel)).unwrap();
+        Bp35a1Command::set_sreg(self, &Sreg::S2(pan_desc.channel)).map_err(|_| ())?;
         // set PanID
-        Bp35a1Command::set_sreg(self, &Sreg::S3(pan_desc.pan_id)).unwrap();
+        Bp35a1Command::set_sreg(self, &Sreg::S3(pan_desc.pan_id)).map_err(|_| ())?;
         // check response
-        self.check_response().await.unwrap();
-        self.check_response().await.unwrap();
+        self.check_response().await?;
+        self.check_response().await?;
 
         // skjoin
         defmt::info!("PANA: joining smart meter");
-        Bp35a1Command::join(self, &ipv6).unwrap();
-        self.check_response().await.unwrap();
+        Bp35a1Command::join(self, &ipv6).map_err(|_| ())?;
+        self.check_response().await?;
         // check event
         loop {
-            match self.receive_bp35a1_packet().await.unwrap() {
+            match self.receive_bp35a1_packet().await? {
                 Bp35a1Packet::Event(event) => match &event.number {
                     EventNumber::PanaConnectionFail => {
                         // pana auth error
@@ -820,16 +1005,16 @@ impl Bp35a1Manager {
                     }
                     _e => {
                         debug!("event: {:?}", defmt::Debug2Format(&_e));
-                        core::unreachable!()
+                        return Err(());
                     }
                 },
                 Bp35a1Packet::UdpPacket(udp) => {
                     defmt::debug!("Receive udp packet, skip");
                     // skip data and \r\n
-                    let grant = self.uart_rx.read().unwrap();
+                    let grant = self.uart_rx.read().map_err(|_| ())?;
                     grant.release(udp.data_size * 2 + 2);
                 }
-                _ => core::unreachable!(),
+                _ => return Err(()),
             }
         }
     }
