@@ -84,6 +84,19 @@ OK: smart meter instantaneous power = 460 W
 
 通信異常が明らかな場合は、ファームウェアを再書き込みする前にW5500-EVB-Pico、Wi-SUNモジュール、Debug Probeの電源と配線を確認し、必要に応じて端末と基板を再起動してください。
 
+## 異常時の自動復旧
+
+通信中にWi-SUNモジュールから期待した応答が返らない場合、RP2040側でタイムアウトを検出してWi-SUNモジュールを自動的に再起動します。対象はRP2040本体ではなく、GPIO15に接続されたWi-SUNモジュールです。
+
+- `SKSENDTO` の応答が5秒以内にない場合
+- パケット送信後、スマートメーターからの `ERXUDP` 応答が5秒以内にない場合
+- PANA認証が60秒以内に完了しない場合
+- UARTエラーや受信パケットの解析エラーが発生した場合
+
+異常を検出すると、RESETピンをLOWに1秒保持してからHIGHに戻し、UART受信キューの古いデータを破棄したうえでPANA認証を再実行します。再接続は最大3回試行します。復旧中はPC側のTCP接続がタイムアウトすることがありますが、ログに `Wi-SUN: PANA authentication completed` が出た後に確認スクリプトを再実行してください。
+
+3回試行しても復旧できない場合は、ファームウェアが無限にリセットを繰り返さず、`Wi-SUN: recovery failed; please restart the microcontroller and smart-meter path` を出力して停止します。この場合はマイコン、Wi-SUNモジュール、スマートメーターの電源・配線を確認して再起動してください。
+
 ## 認証情報
 
 Wi-SUNのBルート認証情報は`src/broute_credential.rs`にあります。実際の認証情報を含むファイルを公開リポジトリへコミットしないでください。
