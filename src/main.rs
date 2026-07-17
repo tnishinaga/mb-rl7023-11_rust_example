@@ -1,8 +1,4 @@
-//! This example implements a TCP echo server on port 1234 and using DHCP.
-//! Send it some data, you should see it echoed back and printed in the console.
-//!
-//! Example written for the [`WIZnet W5500-EVB-Pico`](https://www.wiznet.io/product-item/w5500-evb-pico/) board.
-
+// This code is based on https://github.com/embassy-rs/embassy/blob/main/examples/rp/src/bin/ethernet_w5500_tcp_server.rs
 // Assisted-by: Codex:GPT-5.6 Luna
 
 #![no_std]
